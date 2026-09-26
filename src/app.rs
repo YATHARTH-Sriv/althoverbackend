@@ -1,7 +1,17 @@
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 
-use crate::handlers::health;
+use crate::{
+    AppState,
+    handlers::{auth_challenge, auth_verify, health},
+};
 
-pub fn create_app() -> Router {
-    Router::new().route("/health", get(health))
+pub fn create_app(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/auth/challenge", post(auth_challenge))
+        .route("/auth/verify", post(auth_verify))
+        .with_state(state)
 }

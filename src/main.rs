@@ -1,9 +1,20 @@
-use myagentrust::create_app;
+use myagentrust::{AppState, create_app, db::create_pool};
 
 #[tokio::main]
-async fn main() {
-    let app = create_app();
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:9000").await.unwrap();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
 
-    axum::serve(listener, app).await.unwrap();
+    let database_url = std::env::var("DATABASE_URL")?;
+    let pool = create_pool(&database_url).await?;
+
+    sqlx::migrate!().run(&pool).await?;
+
+    let state = AppState { db: pool };
+    let app = create_app(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:9000").await?;
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
