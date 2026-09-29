@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::{ApiError, AppState, bad_request, internal_error};
 
+use super::receipts::{PublicReceipt, load_receipts_for_settings};
 use super::settings_management::refresh_settings_by_pda;
 use super::smart_accounts::{SmartAccountResponse, SmartAccountRow, refresh_smart_account_balance};
 use super::transaction_lifecycle::{TransactionResponse, load_transactions_for_dashboard};
@@ -81,7 +82,7 @@ pub struct DashboardSettingsResponse {
     signers: Vec<DashboardSignerResponse>,
     smart_accounts: Vec<SmartAccountResponse>,
     transactions: Vec<TransactionResponse>,
-    receipts: Vec<serde_json::Value>,
+    receipts: Vec<PublicReceipt>,
     activities: Vec<DashboardActivityResponse>,
 }
 
@@ -256,6 +257,7 @@ pub async fn dashboard(
             query.refresh.unwrap_or(false),
         )
         .await?;
+        let receipts = load_receipts_for_settings(&state, row.id).await?;
 
         settings.push(DashboardSettingsResponse {
             id: row.id,
@@ -269,7 +271,7 @@ pub async fn dashboard(
             signers,
             smart_accounts,
             transactions,
-            receipts: Vec::new(),
+            receipts,
             activities,
         });
     }

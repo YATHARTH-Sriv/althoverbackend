@@ -23,6 +23,8 @@ use crate::{
     },
 };
 
+use super::receipts::{link_receipt_to_transaction, mark_transaction_receipt_paid};
+
 const INITIATE_PERMISSION: i32 = 1;
 const VOTE_PERMISSION: i32 = 2;
 const EXECUTE_PERMISSION: i32 = 4;
@@ -180,7 +182,7 @@ pub struct WalletSubmittedRequest {
     proposal_tx_sig: String,
     memo: Option<String>,
     smart_account_name: Option<String>,
-    receipt_id: Option<String>,
+    receipt_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,6 +441,9 @@ async fn sync_proposal(
     .fetch_one(&state.db)
     .await
     .map_err(internal_error)?;
+    if proposal.status.database_value() == "EXECUTED" {
+        mark_transaction_receipt_paid(state, updated.id).await?;
+    }
     Ok((updated, proposal))
 }
 
@@ -636,12 +641,16 @@ pub async fn wallet_transaction_submitted(
         ON CONFLICT DO NOTHING"#)
         .bind(settings.workspace_id).bind(settings.id).bind(smart_account_id).bind(row.id).bind(create_sig.to_string())
         .execute(&state.db).await.map_err(internal_error)?;
+    if let Some(receipt_id) = payload.receipt_id {
+        link_receipt_to_transaction(&state, receipt_id, settings.id, smart_account_id, row.id)
+            .await?;
+    }
     let stale_index = settings
         .stale_transaction_index
         .parse::<u64>()
         .map_err(internal_error)?;
     let response = transaction_response(&state, row, stale_index).await?;
-    let _ = (payload.smart_account_name, payload.receipt_id);
+    let _ = payload.smart_account_name;
     Ok(Json(TransactionProposalEnvelope {
         transaction: response,
         proposal: proposal_response(&proposal),
@@ -877,6 +886,7 @@ pub async fn execute_submitted(
     .fetch_one(&state.db)
     .await
     .map_err(internal_error)?;
+    mark_transaction_receipt_paid(&state, row.id).await?;
     let stale = sqlx::query_scalar::<_, String>(
         "SELECT stale_transaction_index::text FROM settings_accounts WHERE id = $1",
     )

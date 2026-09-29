@@ -11,14 +11,16 @@ use uuid::Uuid;
 
 use crate::{ApiError, AppState, bad_request, internal_error};
 
+use super::extension_auth::extension_challenge_context;
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthChallengeRequest {
     wallet_address: String,
-    // purpose: Option<String>,
-    // settings_pda: Option<String>,
-    // code_challenge: Option<String>,
-    // extension_id: Option<String>,
+    purpose: Option<String>,
+    settings_pda: Option<String>,
+    code_challenge: Option<String>,
+    extension_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -29,7 +31,7 @@ pub struct AuthChallengeResponse {
     nonce_expires_at: DateTime<Utc>,
 }
 
-fn normalize_wallet_address(value: &str) -> Result<String, ApiError> {
+pub(crate) fn normalize_wallet_address(value: &str) -> Result<String, ApiError> {
     Pubkey::from_str(value.trim())
         .map(|pubkey| pubkey.to_string())
         .map_err(|_| bad_request("walletAddress is invalid"))
@@ -50,8 +52,15 @@ pub async fn auth_challenge(
     // println!("Wallet Address : {:?}", payload.wallet_address)
     let walletaddress = normalize_wallet_address(&payload.wallet_address)?;
     let nonce = generate_nonce()?;
-    let message =
-        format!("Hover Agent wallet login\n\n  Wallet: {walletaddress}\n  Nonce: {nonce}");
+    let extension_context = extension_challenge_context(
+        payload.purpose.as_deref(),
+        payload.settings_pda.as_deref(),
+        payload.code_challenge.as_deref(),
+        payload.extension_id.as_deref(),
+    )?;
+    let message = format!(
+        "Hover Agent wallet login\n\n  Wallet: {walletaddress}\n  Nonce: {nonce}{extension_context}"
+    );
     let nonce_expires_at = Utc::now() + Duration::minutes(10);
     sqlx::query(
         r#"
@@ -132,7 +141,7 @@ pub struct AuthVerifyResponse {
     wallet: Wallet,
 }
 
-fn verify_wallet_signature(
+pub(crate) fn verify_wallet_signature(
     wallet_address: &str,
     message: &str,
     signature_input: &str,

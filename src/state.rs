@@ -7,4 +7,5 @@ use sqlx::PgPool;
 pub struct AppState {
     pub db: PgPool,
     pub rpc: Arc<RpcClient>,
+    pub http: reqwest::Client,
 }
