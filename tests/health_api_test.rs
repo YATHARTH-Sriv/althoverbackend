@@ -2,12 +2,23 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
-use myagentrust::create_app;
+use myagentrust::{AppState, create_app, solanasetup::create_rpc_client};
+use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
+
+fn test_app() -> axum::Router {
+    let db = PgPoolOptions::new()
+        .connect_lazy("postgres://postgres:postgres@localhost/test")
+        .expect("test database URL should be valid");
+    create_app(AppState {
+        db,
+        rpc: create_rpc_client("http://127.0.0.1:8899"),
+    })
+}
 
 #[tokio::test]
 async fn health_returns_ok_json() {
-    let app = create_app();
+    let app = test_app();
 
     let request = Request::builder()
         .method("GET")
@@ -31,7 +42,7 @@ async fn health_returns_ok_json() {
 
 #[tokio::test]
 async fn unknown_route_returns_not_found() {
-    let app = create_app();
+    let app = test_app();
 
     let request = Request::builder()
         .method("GET")
@@ -45,7 +56,7 @@ async fn unknown_route_returns_not_found() {
 
 #[tokio::test]
 async fn health_rejects_unsupported_method() {
-    let response = create_app()
+    let response = test_app()
         .oneshot(
             Request::builder()
                 .method("POST")
