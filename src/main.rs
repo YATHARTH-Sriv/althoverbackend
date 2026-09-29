@@ -11,7 +11,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     sqlx::migrate!().run(&pool).await?;
 
-    let state = AppState { db: pool, rpc };
+    let state = AppState {
+        db: pool,
+        rpc,
+        http: reqwest::Client::new(),
+    };
     let app = create_app(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9000").await?;

@@ -17,6 +17,15 @@ pub fn bad_request(message: impl Into<String>) -> ApiError {
     )
 }
 
+pub fn unauthorized(message: impl Into<String>) -> ApiError {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorBody {
+            error: message.into(),
+        }),
+    )
+}
+
 pub fn internal_error(error: impl std::fmt::Display) -> ApiError {
     eprintln!("internal server error: {error}");
 

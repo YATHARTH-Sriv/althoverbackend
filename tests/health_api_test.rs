@@ -13,6 +13,7 @@ fn test_app() -> axum::Router {
     create_app(AppState {
         db,
         rpc: create_rpc_client("http://127.0.0.1:8899"),
+        http: reqwest::Client::new(),
     })
 }
 
