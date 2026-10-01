@@ -16,8 +16,6 @@ use super::auth::{normalize_wallet_address, verify_wallet_signature};
 const EXTENSION_SESSION_TTL_DAYS: i64 = 30;
 const EXTENSION_EXCHANGE_TTL_MINUTES: i64 = 10;
 const DEFAULT_SESSION_NAME: &str = "Hover Capture";
-const DEVELOPMENT_TOKEN_PEPPER: &str = "hover-local-dev-pepper";
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateExtensionSessionRequest {
@@ -178,7 +176,10 @@ fn validate_code_challenge(value: Option<&str>) -> Result<String, ApiError> {
     Ok(value.to_owned())
 }
 
-fn normalize_extension_id(value: Option<&str>) -> Result<Option<String>, ApiError> {
+fn normalize_extension_id(
+    value: Option<&str>,
+    allowed_extension_ids: &[String],
+) -> Result<Option<String>, ApiError> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -186,11 +187,9 @@ fn normalize_extension_id(value: Option<&str>) -> Result<Option<String>, ApiErro
         return Err(bad_request("extensionId is invalid"));
     }
 
-    let allowed = std::env::var("EXTENSION_IDS").unwrap_or_default();
-    if !allowed.trim().is_empty()
-        && !allowed
-            .split(',')
-            .map(str::trim)
+    if !allowed_extension_ids.is_empty()
+        && !allowed_extension_ids
+            .iter()
             .any(|allowed_id| allowed_id == value)
     {
         return Err(bad_request("extensionId is not allowed"));
@@ -204,6 +203,7 @@ pub(crate) fn extension_challenge_context(
     settings_pda: Option<&str>,
     code_challenge: Option<&str>,
     extension_id: Option<&str>,
+    allowed_extension_ids: &[String],
 ) -> Result<String, ApiError> {
     if purpose.map(str::trim) != Some("extension-session") {
         return Ok(String::new());
@@ -216,8 +216,8 @@ pub(crate) fn extension_challenge_context(
         .map_err(|_| bad_request("settingsPda is invalid"))?
         .to_string();
     let code_challenge = validate_code_challenge(code_challenge)?;
-    let extension_id =
-        normalize_extension_id(extension_id)?.unwrap_or_else(|| "unpacked-development".to_owned());
+    let extension_id = normalize_extension_id(extension_id, allowed_extension_ids)?
+        .unwrap_or_else(|| "unpacked-development".to_owned());
 
     Ok(format!(
         "\n  Purpose: extension-session\n  Settings: {settings_pda}\n  PKCE Challenge: {code_challenge}\n  Extension ID: {extension_id}"
@@ -238,23 +238,13 @@ fn extension_exchange_code_hash(code: &str) -> String {
     sha256_hex(&format!("hover-extension-code:{code}"))
 }
 
-fn extension_token_pepper() -> Result<String, ApiError> {
-    if let Ok(value) = std::env::var("EXTENSION_TOKEN_PEPPER")
-        && !value.trim().is_empty()
-    {
-        return Ok(value);
-    }
-    if std::env::var("NODE_ENV").as_deref() != Ok("production") {
-        return Ok(DEVELOPMENT_TOKEN_PEPPER.to_owned());
-    }
-    Err(internal_error("EXTENSION_TOKEN_PEPPER is required"))
-}
-
-pub(crate) fn extension_token_hash(token: &str) -> Result<String, ApiError> {
-    Ok(sha256_hex(&format!(
-        "{}:{token}",
-        extension_token_pepper()?
-    )))
+pub(crate) fn extension_token_hash(state: &AppState, token: &str) -> Result<String, ApiError> {
+    let pepper = state
+        .config
+        .extension_token_pepper
+        .as_deref()
+        .ok_or_else(|| internal_error("EXTENSION_TOKEN_PEPPER is required"))?;
+    Ok(sha256_hex(&format!("{}:{token}", pepper)))
 }
 
 fn pkce_challenge(verifier: &str) -> String {
@@ -313,7 +303,8 @@ pub async fn create_extension_session(
         .to_string();
     let message = required_trimmed(&payload.message, "message")?;
     let code_challenge = validate_code_challenge(Some(&payload.code_challenge))?;
-    let extension_id = normalize_extension_id(payload.extension_id.as_deref())?;
+    let extension_id =
+        normalize_extension_id(payload.extension_id.as_deref(), &state.config.extension_ids)?;
     let extension_label = extension_id
         .clone()
         .unwrap_or_else(|| "unpacked-development".to_owned());
@@ -463,7 +454,7 @@ pub async fn exchange_extension_session(
     }
 
     let token = generate_secret("hvr_ext_")?;
-    let token_hash = extension_token_hash(&token)?;
+    let token_hash = extension_token_hash(&state, &token)?;
     let claimed = sqlx::query(
         r#"
         UPDATE extension_sessions
@@ -546,7 +537,7 @@ pub async fn get_extension_session(
     headers: HeaderMap,
 ) -> Result<Json<GetExtensionSessionResponse>, ApiError> {
     let token = bearer_token(&headers)?;
-    let token_hash = extension_token_hash(&token)?;
+    let token_hash = extension_token_hash(&state, &token)?;
     let session_id =
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM extension_sessions WHERE token_hash = $1")
             .bind(token_hash)
@@ -593,7 +584,7 @@ pub async fn revoke_extension_session(
     headers: HeaderMap,
 ) -> Result<Json<RevokeExtensionSessionResponse>, ApiError> {
     let token = bearer_token(&headers)?;
-    let token_hash = extension_token_hash(&token)?;
+    let token_hash = extension_token_hash(&state, &token)?;
     sqlx::query(
         r#"
         UPDATE extension_sessions
@@ -630,6 +621,7 @@ mod tests {
                 Some("11111111111111111111111111111111"),
                 Some("short"),
                 None,
+                &[],
             )
             .is_err()
         );

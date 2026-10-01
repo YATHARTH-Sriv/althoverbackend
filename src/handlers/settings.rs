@@ -3,7 +3,7 @@ use std::{collections::HashSet, str::FromStr};
 use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use solana_sdk::{pubkey::Pubkey, signature::Signature};
+use solana_sdk::signature::Signature;
 use sqlx::prelude::FromRow;
 use uuid::Uuid;
 
@@ -17,6 +17,7 @@ use crate::{
         CreateSmartAccountArgs, Permissions, SmartAccountSigner,
         build_create_smart_account_instruction, decode_settings_account, fetch_program_config,
     },
+    validation::parse_pubkey,
 };
 
 const INITIATE_PERMISSION: u8 = 1;
@@ -613,18 +614,6 @@ pub async fn settings_submitted(
             signers,
         },
     }))
-}
-
-/// Helpers
-
-fn parse_pubkey(value: &str, field: &str) -> Result<Pubkey, ApiError> {
-    let value = value.trim();
-
-    if value.is_empty() {
-        return Err(bad_request(format!("{field} is required")));
-    }
-
-    Pubkey::from_str(value).map_err(|_| bad_request(format!("{field} is invalid")))
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {

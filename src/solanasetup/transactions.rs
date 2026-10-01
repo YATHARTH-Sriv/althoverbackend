@@ -7,6 +7,7 @@ use solana_sdk::{
     hash::Hash, instruction::Instruction, message::Message, pubkey::Pubkey, signature::Signature,
     transaction::Transaction,
 };
+use solana_system_interface::instruction::SystemInstruction;
 use solana_transaction_status_client_types::UiTransactionEncoding;
 
 use crate::solanasetup::PROGRAM_ID;
@@ -54,6 +55,92 @@ pub async fn verify_confirmed_transaction(
 ) -> Result<(), String> {
     verify_confirmed_transaction_inner(rpc, signature, expected_signer, expected_accounts, None)
         .await
+}
+
+pub async fn verify_confirmed_sol_transfer(
+    rpc: &RpcClient,
+    signature: &Signature,
+    expected_signer: &Pubkey,
+    expected_recipient: &Pubkey,
+    expected_lamports: u64,
+) -> Result<(), String> {
+    let confirmed = rpc
+        .confirm_transaction_with_commitment(signature, CommitmentConfig::confirmed())
+        .await
+        .map_err(|error| format!("Failed to confirm transaction: {error}"))?;
+    if !confirmed.value {
+        return Err("Transaction is not confirmed".to_owned());
+    }
+
+    let confirmed_transaction = rpc
+        .get_transaction_with_config(
+            signature,
+            RpcTransactionConfig {
+                encoding: Some(UiTransactionEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                max_supported_transaction_version: Some(0),
+            },
+        )
+        .await
+        .map_err(|error| format!("Unable to retrieve confirmed transaction: {error}"))?;
+    let metadata = confirmed_transaction
+        .transaction
+        .meta
+        .ok_or_else(|| "Confirmed transaction has no metadata".to_owned())?;
+    if let Some(error) = metadata.err {
+        return Err(format!("Transaction failed on-chain: {error:?}"));
+    }
+    let transaction = confirmed_transaction
+        .transaction
+        .transaction
+        .decode()
+        .ok_or_else(|| "Unable to decode confirmed transaction".to_owned())?;
+    let account_keys = transaction.message.static_account_keys();
+    let required_signatures = usize::from(transaction.message.header().num_required_signatures);
+    let signer_keys = account_keys
+        .get(..required_signatures)
+        .ok_or_else(|| "Invalid transaction signer metadata".to_owned())?;
+    if !signer_keys.contains(expected_signer) {
+        return Err("Transaction was not signed by the expected wallet".to_owned());
+    }
+
+    let valid_transfer = transaction
+        .message
+        .instructions()
+        .iter()
+        .any(|instruction| {
+            let Some(program_id) = account_keys.get(usize::from(instruction.program_id_index))
+            else {
+                return false;
+            };
+            if program_id != &solana_system_interface::program::id()
+                || instruction.accounts.len() < 2
+            {
+                return false;
+            }
+            let Some(from) = account_keys.get(usize::from(instruction.accounts[0])) else {
+                return false;
+            };
+            let Some(to) = account_keys.get(usize::from(instruction.accounts[1])) else {
+                return false;
+            };
+            let Ok(system_instruction) =
+                bincode::deserialize::<SystemInstruction>(&instruction.data)
+            else {
+                return false;
+            };
+            matches!(
+                system_instruction,
+                SystemInstruction::Transfer { lamports }
+                    if from == expected_signer
+                        && to == expected_recipient
+                        && lamports == expected_lamports
+            )
+        });
+    if !valid_transfer {
+        return Err("Transaction does not contain the expected SOL transfer".to_owned());
+    }
+    Ok(())
 }
 
 pub async fn verify_confirmed_squads_instruction(

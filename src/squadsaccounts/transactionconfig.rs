@@ -218,6 +218,28 @@ pub fn build_approve_proposal_instruction(
     ))
 }
 
+pub fn build_reject_proposal_instruction(
+    settings: Pubkey,
+    signer: Pubkey,
+    transaction_index: u64,
+) -> Result<(Pubkey, Instruction), String> {
+    let (proposal, _) = derive_proposal_pda(&settings, transaction_index);
+    Ok((
+        proposal,
+        Instruction {
+            program_id: PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new_readonly(settings, false),
+                AccountMeta::new(signer, true),
+                AccountMeta::new(proposal, false),
+                AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+                AccountMeta::new_readonly(PROGRAM_ID, false),
+            ],
+            data: instruction_data("global:reject_proposal", &VoteOnProposalArgs { memo: None })?,
+        },
+    ))
+}
+
 pub fn build_execute_transaction_instruction(
     settings: Pubkey,
     signer: Pubkey,
@@ -375,5 +397,25 @@ mod tests {
 
         assert!(wallet_meta.is_signer);
         assert!(!smart_account_meta.is_signer);
+    }
+
+    #[test]
+    fn reject_proposal_instruction_uses_expected_discriminator_and_signer() {
+        let settings = Pubkey::new_unique();
+        let signer = Pubkey::new_unique();
+
+        let (_, instruction) = build_reject_proposal_instruction(settings, signer, 7).unwrap();
+
+        assert_eq!(
+            &instruction.data[..8],
+            &anchor_discriminator("global:reject_proposal")
+        );
+        let signer_meta = instruction
+            .accounts
+            .iter()
+            .find(|meta| meta.pubkey == signer)
+            .unwrap();
+        assert!(signer_meta.is_signer);
+        assert!(signer_meta.is_writable);
     }
 }

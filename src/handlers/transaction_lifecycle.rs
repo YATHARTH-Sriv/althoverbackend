@@ -1,12 +1,10 @@
-use std::str::FromStr;
-
 use axum::{
     Json,
     extract::{Path, Query, State},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use solana_sdk::{pubkey::Pubkey, signature::Signature};
+use solana_sdk::pubkey::Pubkey;
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -19,8 +17,10 @@ use crate::{
     squadsaccounts::{
         ProposalAccount, build_approve_proposal_instruction, build_create_proposal_instruction,
         build_create_transaction_instruction, build_execute_transaction_instruction,
-        decode_proposal_account, decode_settings_account, decode_transaction_message,
+        build_reject_proposal_instruction, decode_proposal_account, decode_settings_account,
+        decode_transaction_message,
     },
+    validation::{parse_pubkey, parse_signature},
 };
 
 use super::receipts::{link_receipt_to_transaction, mark_transaction_receipt_paid};
@@ -35,6 +35,28 @@ struct SettingsForTransaction {
     workspace_id: Uuid,
     pda: String,
     stale_transaction_index: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ApprovalWithTransaction {
+    transaction_record_id: Uuid,
+    id: Uuid,
+    wallet_address: String,
+    tx_sig: Option<String>,
+    status: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+struct PayoutWithTransaction {
+    transaction_record_id: Uuid,
+    payout_id: Uuid,
+    title: String,
+    description: Option<String>,
+    category: String,
+    recipient_name: String,
+    recipient_memo: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -70,6 +92,17 @@ pub(crate) struct ApprovalResponse {
     updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PayoutContextResponse {
+    payout_id: Uuid,
+    title: String,
+    description: Option<String>,
+    category: String,
+    recipient_name: String,
+    recipient_memo: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TransactionResponse {
@@ -96,6 +129,7 @@ pub(crate) struct TransactionResponse {
     pub(crate) approvals: Vec<ApprovalResponse>,
     pub(crate) is_stale: bool,
     pub(crate) stale_reason: Option<&'static str>,
+    pub(crate) payout: Option<PayoutContextResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,14 +265,6 @@ pub struct ProposalResponse {
     cancelled: Vec<String>,
 }
 
-fn parse_pubkey(value: &str, field: &str) -> Result<Pubkey, ApiError> {
-    Pubkey::from_str(value.trim()).map_err(|_| bad_request(format!("{field} is invalid")))
-}
-
-fn parse_signature(value: &str, field: &str) -> Result<Signature, ApiError> {
-    Signature::from_str(value.trim()).map_err(|_| bad_request(format!("{field} is invalid")))
-}
-
 fn normalize_memo(value: Option<String>) -> String {
     value
         .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_owned()))
@@ -316,10 +342,38 @@ async fn load_approvals(
     .map_err(internal_error)
 }
 
+async fn load_payout_context(
+    state: &AppState,
+    transaction_id: Uuid,
+) -> Result<Option<PayoutContextResponse>, ApiError> {
+    sqlx::query_as::<_, PayoutContextResponse>(
+        r#"SELECT p.id AS payout_id, p.title, p.description, p.category,
+                  pr.name AS recipient_name, pr.memo AS recipient_memo
+           FROM payout_recipients pr
+           JOIN payout_batches p ON p.id = pr.payout_batch_id
+           WHERE pr.transaction_record_id = $1"#,
+    )
+    .bind(transaction_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal_error)
+}
+
 pub(crate) async fn transaction_response(
     state: &AppState,
     row: TransactionRow,
     stale_index: u64,
+) -> Result<TransactionResponse, ApiError> {
+    let approvals = load_approvals(state, row.id).await?;
+    let payout = load_payout_context(state, row.id).await?;
+    transaction_response_with_context(row, stale_index, approvals, payout)
+}
+
+fn transaction_response_with_context(
+    row: TransactionRow,
+    stale_index: u64,
+    approvals: Vec<ApprovalResponse>,
+    payout: Option<PayoutContextResponse>,
 ) -> Result<TransactionResponse, ApiError> {
     let is_stale = row.status == "PROPOSAL_ACTIVE"
         && row
@@ -327,7 +381,6 @@ pub(crate) async fn transaction_response(
             .parse::<u64>()
             .map_err(internal_error)?
             <= stale_index;
-    let approvals = load_approvals(state, row.id).await?;
     Ok(TransactionResponse {
         id: row.id,
         settings_account_id: row.settings_account_id,
@@ -351,6 +404,7 @@ pub(crate) async fn transaction_response(
         approvals,
         is_stale,
         stale_reason: is_stale.then_some("Settings changed after this proposal was created"),
+        payout,
     })
 }
 
@@ -368,7 +422,8 @@ pub(crate) async fn load_transactions_for_dashboard(
                   created_at, updated_at
            FROM transaction_records
            WHERE settings_account_id = $1
-           ORDER BY transaction_index DESC"#,
+           ORDER BY transaction_index DESC
+           LIMIT 100"#,
     )
     .bind(settings_id)
     .fetch_all(&state.db)
@@ -383,11 +438,73 @@ pub(crate) async fn load_transactions_for_dashboard(
         rows = refreshed;
     }
 
-    let mut transactions = Vec::with_capacity(rows.len());
-    for row in rows {
-        transactions.push(transaction_response(state, row, stale_index).await?);
+    let transaction_ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let approval_rows = sqlx::query_as::<_, ApprovalWithTransaction>(
+        r#"SELECT transaction_record_id, id, wallet_address, tx_sig, status,
+                  created_at, updated_at
+           FROM proposal_approvals
+           WHERE transaction_record_id = ANY($1)
+           ORDER BY created_at"#,
+    )
+    .bind(&transaction_ids)
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal_error)?;
+    let payout_rows = sqlx::query_as::<_, PayoutWithTransaction>(
+        r#"SELECT pr.transaction_record_id, p.id AS payout_id, p.title,
+                  p.description, p.category, pr.name AS recipient_name,
+                  pr.memo AS recipient_memo
+           FROM payout_recipients pr
+           JOIN payout_batches p ON p.id = pr.payout_batch_id
+           WHERE pr.transaction_record_id = ANY($1)"#,
+    )
+    .bind(&transaction_ids)
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal_error)?;
+
+    let mut approvals_by_transaction: HashMap<Uuid, Vec<ApprovalResponse>> = HashMap::new();
+    for approval in approval_rows {
+        approvals_by_transaction
+            .entry(approval.transaction_record_id)
+            .or_default()
+            .push(ApprovalResponse {
+                id: approval.id,
+                wallet_address: approval.wallet_address,
+                tx_sig: approval.tx_sig,
+                status: approval.status,
+                created_at: approval.created_at,
+                updated_at: approval.updated_at,
+            });
     }
-    Ok(transactions)
+    let payouts_by_transaction: HashMap<Uuid, PayoutContextResponse> = payout_rows
+        .into_iter()
+        .map(|payout| {
+            (
+                payout.transaction_record_id,
+                PayoutContextResponse {
+                    payout_id: payout.payout_id,
+                    title: payout.title,
+                    description: payout.description,
+                    category: payout.category,
+                    recipient_name: payout.recipient_name,
+                    recipient_memo: payout.recipient_memo,
+                },
+            )
+        })
+        .collect();
+
+    rows.into_iter()
+        .map(|row| {
+            let id = row.id;
+            transaction_response_with_context(
+                row,
+                stale_index,
+                approvals_by_transaction.remove(&id).unwrap_or_default(),
+                payouts_by_transaction.get(&id).cloned(),
+            )
+        })
+        .collect()
 }
 
 async fn load_transaction(state: &AppState, id: &str) -> Result<TransactionRow, ApiError> {
@@ -421,6 +538,18 @@ async fn sync_proposal(
             r#"INSERT INTO proposal_approvals (transaction_record_id, wallet_address, status)
                VALUES ($1, $2, 'APPROVED') ON CONFLICT (transaction_record_id, wallet_address)
                DO UPDATE SET status = 'APPROVED', updated_at = NOW()"#,
+        )
+        .bind(row.id)
+        .bind(wallet.to_string())
+        .execute(&state.db)
+        .await
+        .map_err(internal_error)?;
+    }
+    for wallet in &proposal.rejected {
+        sqlx::query(
+            r#"INSERT INTO proposal_approvals (transaction_record_id, wallet_address, status)
+               VALUES ($1, $2, 'REJECTED') ON CONFLICT (transaction_record_id, wallet_address)
+               DO UPDATE SET status = 'REJECTED', updated_at = NOW()"#,
         )
         .bind(row.id)
         .bind(wallet.to_string())
@@ -790,6 +919,122 @@ pub async fn build_execute_transaction(
     Path(id): Path<String>,
     Query(query): Query<WalletQuery>,
 ) -> Result<Json<BuiltActionResponse>, ApiError> {
+    build_execute_transaction_inner(state, id, query).await
+}
+
+pub async fn build_reject_transaction(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<WalletQuery>,
+) -> Result<Json<BuiltActionResponse>, ApiError> {
+    let wallet = parse_pubkey(
+        query.wallet_address.as_deref().unwrap_or(""),
+        "walletAddress",
+    )?;
+    let row = load_transaction(&state, &id).await?;
+    let settings = sqlx::query_as::<_, SettingsForTransaction>(r#"SELECT id, workspace_id, pda, stale_transaction_index::text AS stale_transaction_index FROM settings_accounts WHERE id = $1"#).bind(row.settings_account_id).fetch_one(&state.db).await.map_err(internal_error)?;
+    require_permission(&state, settings.id, &wallet, VOTE_PERMISSION).await?;
+    let stale = settings
+        .stale_transaction_index
+        .parse::<u64>()
+        .map_err(internal_error)?;
+    let index = row
+        .transaction_index
+        .parse::<u64>()
+        .map_err(internal_error)?;
+    if row.status == "PROPOSAL_ACTIVE" && index <= stale {
+        return Err(bad_request(
+            "This proposal became stale after the signer or threshold settings changed. Create a new transaction proposal.",
+        ));
+    }
+    if row.status != "PROPOSAL_ACTIVE" {
+        return Err(bad_request(format!(
+            "A {} proposal cannot be rejected",
+            row.status.to_lowercase()
+        )));
+    }
+    let settings_pda = parse_pubkey(&settings.pda, "settingsPda")?;
+    let (proposal_pda, instruction) =
+        build_reject_proposal_instruction(settings_pda, wallet, index).map_err(internal_error)?;
+    let blockhash = state
+        .rpc
+        .get_latest_blockhash()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(BuiltActionResponse {
+        transaction_id: row.id,
+        wallet_address: wallet.to_string(),
+        transaction_base64: build_unsigned_transaction_base64(wallet, blockhash, instruction)
+            .map_err(internal_error)?,
+        proposal_pda: proposal_pda.to_string(),
+        smart_account_pda: None,
+    }))
+}
+
+pub async fn rejection_submitted(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<SubmittedActionRequest>,
+) -> Result<Json<TransactionProposalEnvelope>, ApiError> {
+    let wallet = parse_pubkey(&payload.wallet_address, "walletAddress")?;
+    let sig = parse_signature(&payload.tx_sig, "txSig")?;
+    let row = load_transaction(&state, &id).await?;
+    let settings_pda = parse_pubkey(
+        &sqlx::query_scalar::<_, String>("SELECT pda FROM settings_accounts WHERE id = $1")
+            .bind(row.settings_account_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(internal_error)?,
+        "settingsPda",
+    )?;
+    let proposal_pda = parse_pubkey(&row.proposal_pda, "proposalPda")?;
+    verify_confirmed_squads_instruction(
+        &state.rpc,
+        &sig,
+        &wallet,
+        &[settings_pda, proposal_pda],
+        "global:reject_proposal",
+    )
+    .await
+    .map_err(bad_request)?;
+    let proposal = fetch_proposal(&state, &proposal_pda).await?;
+    if !proposal.rejected.contains(&wallet) {
+        return Err(bad_request(
+            "Confirmed transaction did not record the requested rejection",
+        ));
+    }
+    sqlx::query(
+        r#"INSERT INTO proposal_approvals (transaction_record_id, wallet_address, tx_sig, status)
+        VALUES ($1,$2,$3,'REJECTED') ON CONFLICT (transaction_record_id, wallet_address)
+        DO UPDATE SET tx_sig = EXCLUDED.tx_sig, status = 'REJECTED', updated_at = NOW()"#,
+    )
+    .bind(row.id)
+    .bind(wallet.to_string())
+    .bind(sig.to_string())
+    .execute(&state.db)
+    .await
+    .map_err(internal_error)?;
+    let (row, proposal) = sync_proposal(&state, &row).await?;
+    let stale = sqlx::query_scalar::<_, String>(
+        "SELECT stale_transaction_index::text FROM settings_accounts WHERE id = $1",
+    )
+    .bind(row.settings_account_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(internal_error)?
+    .parse::<u64>()
+    .map_err(internal_error)?;
+    Ok(Json(TransactionProposalEnvelope {
+        transaction: transaction_response(&state, row, stale).await?,
+        proposal: proposal_response(&proposal),
+    }))
+}
+
+async fn build_execute_transaction_inner(
+    state: AppState,
+    id: String,
+    query: WalletQuery,
+) -> Result<Json<BuiltActionResponse>, ApiError> {
     let wallet = parse_pubkey(
         query.wallet_address.as_deref().unwrap_or(""),
         "walletAddress",
@@ -901,3 +1146,4 @@ pub async fn execute_submitted(
         proposal: proposal_response(&proposal),
     }))
 }
+use std::collections::HashMap;

@@ -16,6 +16,7 @@ use crate::{
     solanasetup::{
         build_unsigned_transaction_base64, derive_smart_account_pda, verify_confirmed_transaction,
     },
+    validation::parse_pubkey,
 };
 
 #[derive(Debug, FromRow)]
@@ -132,15 +133,6 @@ pub struct SmartAccountEnvelope {
 pub struct FundSmartAccountSubmittedResponse {
     smart_account: SmartAccountResponse,
     tx_sig: String,
-}
-
-fn parse_pubkey(value: &str, field: &str) -> Result<Pubkey, ApiError> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(bad_request(format!("{field} is required")));
-    }
-
-    Pubkey::from_str(value).map_err(|_| bad_request(format!("{field} is invalid")))
 }
 
 fn parse_signature(value: &str) -> Result<Signature, ApiError> {

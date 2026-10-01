@@ -12,17 +12,16 @@ use solana_sdk::pubkey::Pubkey;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::{ApiError, AppState, bad_request, internal_error};
+use crate::{
+    ApiError, AppState,
+    access::{SettingsAccess, require_settings_access, require_settings_member_by_id},
+    bad_request, internal_error,
+    money::parse_decimal_units,
+};
 
 use super::{auth::normalize_wallet_address, extension_auth::extension_token_hash};
 
 const MAX_RECEIPT_BYTES: usize = 20 * 1024 * 1024;
-
-#[derive(Debug, FromRow)]
-struct SettingsAccess {
-    id: Uuid,
-    workspace_id: Uuid,
-}
 
 #[derive(Debug, FromRow)]
 struct ReceiptRow {
@@ -160,15 +159,12 @@ struct NodeFile {
     size_bytes: usize,
 }
 
-fn internal_url(path: &str) -> String {
-    let base =
-        std::env::var("NODE_INTERNAL_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_owned());
-    format!("{}{}", base.trim_end_matches('/'), path)
-}
-
-fn internal_token() -> Result<String, ApiError> {
-    std::env::var("INTERNAL_SERVICE_TOKEN")
-        .map_err(|_| internal_error("INTERNAL_SERVICE_TOKEN is required"))
+fn internal_token(state: &AppState) -> Result<&str, ApiError> {
+    state
+        .config
+        .internal_service_token
+        .as_deref()
+        .ok_or_else(|| internal_error("INTERNAL_SERVICE_TOKEN is required"))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -217,12 +213,7 @@ fn amount_string(value: Option<&serde_json::Value>) -> Result<Option<String>, Ap
         serde_json::Value::Null => return Ok(None),
         _ => return Err(bad_request("amount is invalid")),
     };
-    let parsed = value
-        .parse::<f64>()
-        .map_err(|_| bad_request("amount is invalid"))?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        return Err(bad_request("amount is invalid"));
-    }
+    parse_decimal_units(&value, 9, "amount")?;
     Ok(Some(value))
 }
 
@@ -321,6 +312,7 @@ pub(crate) async fn load_receipts_for_settings(
         JOIN settings_accounts AS settings ON settings.id = receipt.settings_account_id
         WHERE receipt.settings_account_id = $1
         ORDER BY receipt.created_at DESC
+        LIMIT 100
         "#,
     )
     .bind(settings_id)
@@ -386,20 +378,7 @@ async fn settings_access(
     settings_pda: &str,
     wallet: &str,
 ) -> Result<SettingsAccess, ApiError> {
-    sqlx::query_as::<_, SettingsAccess>(
-        r#"
-        SELECT settings.id, settings.workspace_id
-        FROM settings_accounts AS settings
-        JOIN settings_signers AS signer ON signer.settings_account_id = settings.id
-        WHERE settings.pda = $1 AND signer.wallet_address = $2
-        "#,
-    )
-    .bind(settings_pda)
-    .bind(wallet)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| bad_request("Wallet is not a signer for this settings account"))
+    require_settings_access(state, settings_pda, wallet, None, false).await
 }
 
 async fn ensure_receipt_access(
@@ -407,25 +386,7 @@ async fn ensure_receipt_access(
     receipt: &ReceiptRow,
     wallet: &str,
 ) -> Result<(), ApiError> {
-    let allowed = sqlx::query_scalar::<_, bool>(
-        r#"
-        SELECT EXISTS(
-            SELECT 1 FROM settings_signers
-            WHERE settings_account_id = $1 AND wallet_address = $2
-        )
-        "#,
-    )
-    .bind(receipt.settings_account_id)
-    .bind(wallet)
-    .fetch_one(&state.db)
-    .await
-    .map_err(internal_error)?;
-    if !allowed {
-        return Err(bad_request(
-            "Wallet is not a signer for this settings account",
-        ));
-    }
-    Ok(())
+    require_settings_member_by_id(state, receipt.settings_account_id, wallet).await
 }
 
 async fn process_file(
@@ -441,8 +402,8 @@ async fn process_file(
     let file_name = header_string(headers, "x-file-name").unwrap_or_else(|| "receipt".to_owned());
     let response = state
         .http
-        .post(internal_url("/internal/receipts/process"))
-        .bearer_auth(internal_token()?)
+        .post(state.config.node_url("/internal/receipts/process"))
+        .bearer_auth(internal_token(state)?)
         .header("content-type", mime_type)
         .header("x-file-name", file_name)
         .header("x-hover-settings-account-id", settings_id.to_string())
@@ -463,8 +424,8 @@ async fn process_file(
 async fn delete_internal_file(state: &AppState, pathname: &str) -> Result<(), ApiError> {
     let response = state
         .http
-        .post(internal_url("/internal/receipts/file/delete"))
-        .bearer_auth(internal_token()?)
+        .post(state.config.node_url("/internal/receipts/file/delete"))
+        .bearer_auth(internal_token(state)?)
         .json(&serde_json::json!({ "pathname": pathname }))
         .send()
         .await
@@ -492,7 +453,7 @@ async fn insert_processed_receipt(
             "SELECT EXISTS(SELECT 1 FROM smart_accounts WHERE id = $1 AND settings_account_id = $2)",
         )
         .bind(smart_account_id)
-        .bind(settings.id)
+        .bind(settings.settings_account_id)
         .fetch_one(&state.db)
         .await
         .map_err(internal_error)?;
@@ -543,7 +504,7 @@ async fn insert_processed_receipt(
                   confidence, status, created_at, updated_at, $20 AS workspace_id
         "#,
     )
-    .bind(settings.id)
+    .bind(settings.settings_account_id)
     .bind(smart_account_id)
     .bind(wallet)
     .bind(&processed.file.url)
@@ -573,7 +534,7 @@ async fn insert_processed_receipt(
                    VALUES ($1,$2,$3,'RECEIPT_SCANNED','Receipt uploaded',$4)"#,
             )
             .bind(settings.workspace_id)
-            .bind(settings.id)
+            .bind(settings.settings_account_id)
             .bind(smart_account_id)
             .bind(serde_json::json!({ "receiptId": receipt.id, "fileName": receipt.file_name }))
             .execute(&state.db)
@@ -599,7 +560,7 @@ pub async fn scan_receipt(
         .map_err(|_| bad_request("settingsPda is invalid"))?
         .to_string();
     let settings = settings_access(&state, &settings_pda, &wallet).await?;
-    let processed = process_file(&state, settings.id, &headers, &body).await?;
+    let processed = process_file(&state, settings.settings_account_id, &headers, &body).await?;
     let receipt =
         insert_processed_receipt(&state, &settings, &wallet, None, None, None, processed).await?;
     Ok(Json(ReceiptResponse {
@@ -612,11 +573,16 @@ pub async fn extension_scan_receipt(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ReceiptResponse>, ApiError> {
-    let token_hash = extension_token_hash(bearer_token(&headers)?)?;
+    let token_hash = extension_token_hash(&state, bearer_token(&headers)?)?;
     let session = sqlx::query_as::<_, SettingsAccess>(
-        r#"SELECT settings.id, settings.workspace_id
+        r#"SELECT settings.id AS settings_account_id, settings.workspace_id,
+                  settings.settings_authority,
+                  COALESCE(signer.permissions_mask, 0) AS permissions_mask
            FROM extension_sessions AS session
            JOIN settings_accounts AS settings ON settings.id = session.settings_account_id
+           LEFT JOIN settings_signers AS signer
+             ON signer.settings_account_id = settings.id
+            AND signer.wallet_address = session.wallet_address
            WHERE session.token_hash = $1 AND session.revoked_at IS NULL
              AND session.expires_at > NOW()"#,
     )
@@ -637,7 +603,7 @@ pub async fn extension_scan_receipt(
         .transpose()?;
     let source_url = header_string(&headers, "x-hover-source-url");
     let source_title = header_string(&headers, "x-hover-source-title");
-    let processed = process_file(&state, session.id, &headers, &body).await?;
+    let processed = process_file(&state, session.settings_account_id, &headers, &body).await?;
     let receipt = insert_processed_receipt(
         &state,
         &session,
@@ -766,8 +732,8 @@ pub async fn receipt_file(
     ensure_receipt_access(&state, &receipt, &wallet).await?;
     let response = state
         .http
-        .get(internal_url("/internal/receipts/file"))
-        .bearer_auth(internal_token()?)
+        .get(state.config.node_url("/internal/receipts/file"))
+        .bearer_auth(internal_token(&state)?)
         .query(&[("pathname", &receipt.file_pathname)])
         .send()
         .await

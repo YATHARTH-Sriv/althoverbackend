@@ -20,6 +20,7 @@ use crate::{
         SettingsAccount, build_add_signer_instruction, build_change_threshold_instruction,
         build_remove_signer_instruction, decode_settings_account,
     },
+    validation::parse_pubkey,
 };
 
 const VOTE_PERMISSION: u8 = 2;
@@ -200,15 +201,6 @@ pub struct InviteResponse {
 pub struct AddSignerSubmittedResponse {
     settings: SettingsResponse,
     invite: InviteResponse,
-}
-
-fn parse_pubkey(value: &str, field: &str) -> Result<Pubkey, ApiError> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(bad_request(format!("{field} is required")));
-    }
-
-    Pubkey::from_str(value).map_err(|_| bad_request(format!("{field} is invalid")))
 }
 
 fn parse_signature(value: &str) -> Result<Signature, ApiError> {
@@ -659,25 +651,30 @@ pub async fn build_add_signer(
     }))
 }
 
-async fn upsert_signer_profile_and_invite(
-    state: &AppState,
-    indexed: &IndexedSettings,
-    authority: &Pubkey,
-    signer: &Pubkey,
+struct SignerInviteInput<'a> {
+    indexed: &'a IndexedSettings,
+    authority: &'a Pubkey,
+    signer: &'a Pubkey,
     permissions_mask: u8,
     name: Option<String>,
     email: Option<String>,
     designation: Option<String>,
+}
+
+async fn upsert_signer_profile_and_invite(
+    state: &AppState,
+    input: SignerInviteInput<'_>,
 ) -> Result<InviteResponse, ApiError> {
-    let signer_address = signer.to_string();
-    let label = name
+    let signer_address = input.signer.to_string();
+    let label = input
+        .name
         .clone()
-        .or_else(|| designation.clone())
+        .or_else(|| input.designation.clone())
         .unwrap_or_else(|| "Signer".to_owned());
     let mut transaction = state.db.begin().await.map_err(internal_error)?;
 
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("{}:{signer_address}", indexed.id))
+        .bind(format!("{}:{signer_address}", input.indexed.id))
         .execute(&mut *transaction)
         .await
         .map_err(internal_error)?;
@@ -704,9 +701,9 @@ async fn upsert_signer_profile_and_invite(
             "#,
         )
         .bind(user_id)
-        .bind(name.as_deref())
-        .bind(email.as_deref())
-        .bind(designation.as_deref())
+        .bind(input.name.as_deref())
+        .bind(input.email.as_deref())
+        .bind(input.designation.as_deref())
         .fetch_one(&mut *transaction)
         .await
         .map_err(internal_error)?
@@ -718,9 +715,9 @@ async fn upsert_signer_profile_and_invite(
             RETURNING id
             "#,
         )
-        .bind(name.as_deref())
-        .bind(email.as_deref())
-        .bind(designation.as_deref())
+        .bind(input.name.as_deref())
+        .bind(input.email.as_deref())
+        .bind(input.designation.as_deref())
         .fetch_one(&mut *transaction)
         .await
         .map_err(internal_error)?
@@ -752,7 +749,7 @@ async fn upsert_signer_profile_and_invite(
         DO UPDATE SET role = 'MEMBER', updated_at = NOW()
         "#,
     )
-    .bind(indexed.workspace_id)
+    .bind(input.indexed.workspace_id)
     .bind(user_id)
     .execute(&mut *transaction)
     .await
@@ -769,10 +766,10 @@ async fn upsert_signer_profile_and_invite(
         WHERE settings_account_id = $1 AND wallet_address = $2
         "#,
     )
-    .bind(indexed.id)
+    .bind(input.indexed.id)
     .bind(&signer_address)
     .bind(&label)
-    .bind(i32::from(permissions_mask))
+    .bind(i32::from(input.permissions_mask))
     .execute(&mut *transaction)
     .await
     .map_err(internal_error)?;
@@ -787,7 +784,7 @@ async fn upsert_signer_profile_and_invite(
         FOR UPDATE
         "#,
     )
-    .bind(indexed.id)
+    .bind(input.indexed.id)
     .bind(&signer_address)
     .fetch_optional(&mut *transaction)
     .await
@@ -812,11 +809,11 @@ async fn upsert_signer_profile_and_invite(
             "#,
         )
         .bind(invite_id)
-        .bind(email.as_deref())
-        .bind(name.as_deref())
-        .bind(designation.as_deref())
-        .bind(i32::from(permissions_mask))
-        .bind(authority.to_string())
+        .bind(input.email.as_deref())
+        .bind(input.name.as_deref())
+        .bind(input.designation.as_deref())
+        .bind(i32::from(input.permissions_mask))
+        .bind(input.authority.to_string())
         .bind(expires_at)
         .fetch_one(&mut *transaction)
         .await
@@ -845,15 +842,15 @@ async fn upsert_signer_profile_and_invite(
                       permissions_mask, expires_at
             "#,
         )
-        .bind(indexed.workspace_id)
-        .bind(indexed.id)
+        .bind(input.indexed.workspace_id)
+        .bind(input.indexed.id)
         .bind(token)
         .bind(&signer_address)
-        .bind(email.as_deref())
-        .bind(name.as_deref())
-        .bind(designation.as_deref())
-        .bind(i32::from(permissions_mask))
-        .bind(authority.to_string())
+        .bind(input.email.as_deref())
+        .bind(input.name.as_deref())
+        .bind(input.designation.as_deref())
+        .bind(i32::from(input.permissions_mask))
+        .bind(input.authority.to_string())
         .bind(expires_at)
         .fetch_one(&mut *transaction)
         .await
@@ -862,15 +859,10 @@ async fn upsert_signer_profile_and_invite(
 
     transaction.commit().await.map_err(internal_error)?;
 
-    let frontend_url =
-        std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_owned());
-
     Ok(InviteResponse {
-        invite_url: format!(
-            "{}/invite/{}",
-            frontend_url.trim_end_matches('/'),
-            invite.token
-        ),
+        invite_url: state
+            .config
+            .frontend_url(&format!("/invite/{}", invite.token)),
         token: invite.token,
         status: invite.status,
         wallet_address: invite.wallet_address,
@@ -917,13 +909,15 @@ pub async fn add_signer_submitted(
     let designation = normalize_optional_string(payload.designation);
     let invite = upsert_signer_profile_and_invite(
         &state,
-        &indexed,
-        &authority,
-        &signer,
-        permissions_mask,
-        name.clone(),
-        email.clone(),
-        designation.clone(),
+        SignerInviteInput {
+            indexed: &indexed,
+            authority: &authority,
+            signer: &signer,
+            permissions_mask,
+            name: name.clone(),
+            email: email.clone(),
+            designation: designation.clone(),
+        },
     )
     .await?;
 

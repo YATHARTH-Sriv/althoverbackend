@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::{ApiError, AppState, bad_request, internal_error};
+use crate::{ApiError, AppConfig, AppState, bad_request, internal_error};
 
 use super::auth::{normalize_wallet_address, verify_wallet_signature};
 
@@ -150,15 +150,9 @@ fn normalize_invite_token(token: &str) -> Result<&str, ApiError> {
     Ok(token)
 }
 
-fn invite_url(token: &str) -> String {
-    let frontend_url =
-        std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_owned());
-    format!("{}/invite/{token}", frontend_url.trim_end_matches('/'))
-}
-
-fn public_invite(invite: InviteRow) -> PublicInvite {
+fn public_invite(config: &AppConfig, invite: InviteRow) -> PublicInvite {
     PublicInvite {
-        invite_url: invite_url(&invite.token),
+        invite_url: config.frontend_url(&format!("/invite/{}", invite.token)),
         token: invite.token,
         status: invite.status,
         wallet_address: invite.wallet_address,
@@ -268,7 +262,7 @@ pub async fn get_invite(
     let token = normalize_invite_token(&token)?;
     let invite = load_invite(&state, token).await?;
     Ok(Json(InviteResponse {
-        invite: public_invite(invite),
+        invite: public_invite(&state.config, invite),
     }))
 }
 
@@ -491,7 +485,7 @@ pub async fn accept_invite(
     transaction.commit().await.map_err(internal_error)?;
     let accepted_invite = load_invite(&state, &token).await?;
     Ok(Json(AcceptInviteResponse {
-        invite: public_invite(accepted_invite),
+        invite: public_invite(&state.config, accepted_invite),
         dashboard_path: "/dashboard",
     }))
 }

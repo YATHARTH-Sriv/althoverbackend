@@ -1,4 +1,3 @@
--- Add migration script here
 CREATE TABLE wallets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     address TEXT NOT NULL UNIQUE,
