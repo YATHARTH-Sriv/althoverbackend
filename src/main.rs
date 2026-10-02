@@ -20,7 +20,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc_url = std::env::var("SOLANA_RPC_URL")?;
     let rpc = create_rpc_client(&rpc_url);
 
-    sqlx::migrate!().run(&pool).await?;
 
     let state = AppState {
         db: pool,

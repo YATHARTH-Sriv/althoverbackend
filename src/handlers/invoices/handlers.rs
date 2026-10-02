@@ -3,204 +3,24 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use chrono::NaiveDate;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
-use solana_system_interface::instruction as system_instruction;
-use sqlx::{FromRow, Postgres, Transaction};
+use sqlx::{Postgres, Transaction};
 use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, bad_request, internal_error,
     money::{format_units, parse_decimal_units},
-    solanasetup::{build_unsigned_transaction_base64, verify_confirmed_sol_transfer},
 };
 
-use super::{auth::normalize_wallet_address, customers::customer_access};
+use super::super::{auth::normalize_wallet_address, customers::customer_access};
+use super::models::*;
+use super::repository::{load_invoice, public_invoice_context};
+use super::service::{build_transfer, generate_public_token, token_hash, verify_transfer};
 
 const QUANTITY_SCALE: u32 = 6;
 const MONEY_SCALE: u32 = 9;
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InvoiceLineItemInput {
-    description: String,
-    quantity: String,
-    unit_price: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateInvoiceRequest {
-    wallet_address: String,
-    settings_pda: String,
-    customer_id: Uuid,
-    receiving_smart_account_id: Uuid,
-    issue_date: String,
-    due_date: Option<String>,
-    memo: Option<String>,
-    line_items: Vec<InvoiceLineItemInput>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateInvoiceRequest {
-    wallet_address: String,
-    settings_pda: String,
-    customer_id: Option<Uuid>,
-    receiving_smart_account_id: Option<Uuid>,
-    issue_date: Option<String>,
-    due_date: Option<String>,
-    memo: Option<String>,
-    line_items: Option<Vec<InvoiceLineItemInput>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InvoiceAccessQuery {
-    wallet_address: String,
-    settings_pda: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListInvoicesQuery {
-    wallet_address: String,
-    settings_pda: String,
-    status: Option<String>,
-    limit: Option<i64>,
-    offset: Option<i64>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-#[serde(rename_all = "camelCase")]
-struct InvoiceRow {
-    id: Uuid,
-    workspace_id: Uuid,
-    customer_id: Uuid,
-    receiving_smart_account_id: Uuid,
-    invoice_number: i64,
-    status: String,
-    currency: String,
-    issue_date: NaiveDate,
-    due_date: Option<NaiveDate>,
-    customer_business_name: String,
-    customer_billing_email: Option<String>,
-    customer_contact_name: Option<String>,
-    customer_wallet_address: Option<String>,
-    memo: Option<String>,
-    subtotal: String,
-    total: String,
-    amount_paid: String,
-    created_by_wallet: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    sent_at: Option<DateTime<Utc>>,
-    viewed_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-#[serde(rename_all = "camelCase")]
-struct InvoiceLineItemResponse {
-    id: Uuid,
-    position: i32,
-    description: String,
-    quantity: String,
-    unit_price: String,
-    amount: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InvoiceResponse {
-    #[serde(flatten)]
-    invoice: InvoiceRow,
-    line_items: Vec<InvoiceLineItemResponse>,
-    payments: Vec<InvoicePaymentResponse>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-#[serde(rename_all = "camelCase")]
-struct InvoicePaymentResponse {
-    id: Uuid,
-    payer_wallet: String,
-    amount_lamports: String,
-    tx_sig: String,
-    confirmed_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SendInvoiceRequest {
-    wallet_address: String,
-    settings_pda: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SendInvoiceResponse {
-    invoice: InvoiceResponse,
-    public_url: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BuildInvoicePaymentRequest {
-    payer_wallet: String,
-    amount: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BuildInvoicePaymentResponse {
-    transaction_base64: String,
-    recipient: String,
-    amount_lamports: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InvoicePaymentSubmittedRequest {
-    payer_wallet: String,
-    amount_lamports: String,
-    tx_sig: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PublicInvoiceResponse {
-    invoice: InvoiceResponse,
-    workspace_name: String,
-    smart_account_name: String,
-    recipient: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct InvoiceItemResponse {
-    invoice: InvoiceResponse,
-}
-
-#[derive(Debug, Serialize)]
-pub struct InvoiceListResponse {
-    invoices: Vec<InvoiceResponse>,
-}
-
-#[derive(Debug, FromRow)]
-struct CustomerSnapshot {
-    business_name: String,
-    billing_email: Option<String>,
-    contact_name: Option<String>,
-    wallet_address: Option<String>,
-}
-
-struct PreparedLineItem {
-    description: String,
-    quantity_units: i128,
-    unit_price_units: i128,
-    amount_units: i128,
-}
 
 fn parse_date(value: &str, field: &str) -> Result<NaiveDate, ApiError> {
     NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
@@ -329,51 +149,6 @@ async fn replace_line_items(
     Ok(())
 }
 
-async fn load_invoice(
-    state: &AppState,
-    workspace_id: Uuid,
-    id: Uuid,
-) -> Result<InvoiceResponse, ApiError> {
-    let invoice = sqlx::query_as::<_, InvoiceRow>(
-        r#"SELECT id, workspace_id, customer_id, receiving_smart_account_id,
-                  invoice_number, status, currency, issue_date, due_date,
-                  customer_business_name, customer_billing_email, customer_contact_name,
-                  customer_wallet_address, memo, subtotal::text AS subtotal,
-                  total::text AS total, amount_paid::text AS amount_paid,
-                  created_by_wallet, created_at, updated_at, sent_at, viewed_at
-           FROM invoices WHERE id = $1 AND workspace_id = $2"#,
-    )
-    .bind(id)
-    .bind(workspace_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| bad_request("Invoice not found"))?;
-    let line_items = sqlx::query_as::<_, InvoiceLineItemResponse>(
-        r#"SELECT id, position, description, quantity::text AS quantity,
-                  unit_price::text AS unit_price, amount::text AS amount
-           FROM invoice_line_items WHERE invoice_id = $1 ORDER BY position"#,
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(internal_error)?;
-    let payments = sqlx::query_as::<_, InvoicePaymentResponse>(
-        r#"SELECT id, payer_wallet, amount_lamports::text AS amount_lamports,
-                  tx_sig, confirmed_at
-           FROM invoice_payments WHERE invoice_id = $1 ORDER BY confirmed_at DESC"#,
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(internal_error)?;
-    Ok(InvoiceResponse {
-        invoice,
-        line_items,
-        payments,
-    })
-}
-
 pub async fn create_invoice(
     State(state): State<AppState>,
     Json(body): Json<CreateInvoiceRequest>,
@@ -489,54 +264,6 @@ pub async fn list_invoices(
     Ok(Json(InvoiceListResponse { invoices }))
 }
 
-fn token_hash(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
-}
-
-fn generate_public_token() -> Result<String, ApiError> {
-    let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes).map_err(internal_error)?;
-    Ok(hex::encode(bytes))
-}
-
-async fn public_invoice_context(
-    state: &AppState,
-    token: &str,
-    mark_viewed: bool,
-) -> Result<(Uuid, Uuid, String, String, String), ApiError> {
-    let token = token.trim();
-    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(bad_request(
-            "Invoice link is invalid or no longer available",
-        ));
-    }
-    let hash = token_hash(token);
-    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, String)>(
-        r#"SELECT i.id, i.workspace_id, w.name, sa.name, sa.pda
-           FROM invoices i
-           JOIN workspaces w ON w.id = i.workspace_id
-           JOIN smart_accounts sa ON sa.id = i.receiving_smart_account_id
-           WHERE i.public_token_hash = $1
-             AND i.status NOT IN ('DRAFT', 'VOID')"#,
-    )
-    .bind(hash)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| bad_request("Invoice link is invalid or no longer available"))?;
-    if mark_viewed {
-        sqlx::query(
-            r#"UPDATE invoices SET status = CASE WHEN status='SENT' THEN 'VIEWED' ELSE status END,
-               viewed_at = COALESCE(viewed_at, NOW()), updated_at=NOW() WHERE id=$1"#,
-        )
-        .bind(row.0)
-        .execute(&state.db)
-        .await
-        .map_err(internal_error)?;
-    }
-    Ok(row)
-}
-
 pub async fn send_invoice(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -608,14 +335,7 @@ pub async fn build_invoice_payment(
     if amount_lamports > remaining {
         return Err(bad_request("Payment exceeds the remaining invoice balance"));
     }
-    let blockhash = state
-        .rpc
-        .get_latest_blockhash()
-        .await
-        .map_err(internal_error)?;
-    let instruction = system_instruction::transfer(&payer, &recipient, amount_lamports);
-    let transaction_base64 =
-        build_unsigned_transaction_base64(payer, blockhash, instruction).map_err(internal_error)?;
+    let transaction_base64 = build_transfer(&state, payer, recipient, amount_lamports).await?;
     Ok(Json(BuildInvoicePaymentResponse {
         transaction_base64,
         recipient: recipient.to_string(),
@@ -640,15 +360,7 @@ pub async fn invoice_payment_submitted(
     let (invoice_id, workspace_id, workspace_name, smart_account_name, recipient_value) =
         public_invoice_context(&state, &token, false).await?;
     let recipient = Pubkey::from_str(&recipient_value).map_err(internal_error)?;
-    verify_confirmed_sol_transfer(
-        state.rpc.as_ref(),
-        &signature,
-        &payer,
-        &recipient,
-        amount_lamports,
-    )
-    .await
-    .map_err(bad_request)?;
+    verify_transfer(&state, &signature, &payer, &recipient, amount_lamports).await?;
 
     let mut transaction = state.db.begin().await.map_err(internal_error)?;
     let current = sqlx::query_as::<_, (String, String)>(
