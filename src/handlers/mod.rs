@@ -1,9 +1,12 @@
 mod agent;
 mod auth;
+mod customers;
 mod dashboard;
 mod extension_auth;
 mod health;
 mod invites;
+mod invoices;
+mod payouts;
 mod receipts;
 mod settings;
 mod settings_management;
@@ -13,6 +16,7 @@ mod transaction_lifecycle;
 
 pub use agent::{agent_program_config, settings_agent_chat};
 pub use auth::{auth_challenge, auth_verify};
+pub use customers::{archive_customer, create_customer, list_customers, update_customer};
 pub use dashboard::dashboard;
 pub use extension_auth::{
     create_extension_session, exchange_extension_session, get_extension_session,
@@ -20,6 +24,13 @@ pub use extension_auth::{
 };
 pub use health::health;
 pub use invites::{accept_invite, create_invite_challenge, get_invite};
+pub use invoices::{
+    build_invoice_payment, create_invoice, delete_invoice, get_invoice, get_public_invoice,
+    invoice_payment_submitted, list_invoices, send_invoice, update_invoice,
+};
+pub use payouts::{
+    create_payout, delete_payout, get_payout, link_payout_transaction, list_payouts, update_payout,
+};
 pub use receipts::{
     delete_receipt, extension_scan_receipt, receipt_file, receipt_payment_submitted, scan_receipt,
     update_receipt,
@@ -36,6 +47,6 @@ pub use smart_accounts::{
 pub use transaction::send_signed_transaction;
 pub use transaction_lifecycle::{
     approval_submitted, build_approve_transaction, build_create_proposal, build_create_transaction,
-    build_execute_transaction, execute_submitted, refresh_transaction,
-    wallet_transaction_submitted,
+    build_execute_transaction, build_reject_transaction, execute_submitted, refresh_transaction,
+    rejection_submitted, wallet_transaction_submitted,
 };

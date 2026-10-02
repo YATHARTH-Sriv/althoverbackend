@@ -49,7 +49,6 @@ pub async fn auth_challenge(
     State(state): State<AppState>,
     Json(payload): Json<AuthChallengeRequest>,
 ) -> Result<Json<AuthChallengeResponse>, ApiError> {
-    // println!("Wallet Address : {:?}", payload.wallet_address)
     let walletaddress = normalize_wallet_address(&payload.wallet_address)?;
     let nonce = generate_nonce()?;
     let extension_context = extension_challenge_context(
@@ -57,6 +56,7 @@ pub async fn auth_challenge(
         payload.settings_pda.as_deref(),
         payload.code_challenge.as_deref(),
         payload.extension_id.as_deref(),
+        &state.config.extension_ids,
     )?;
     let message = format!(
         "Hover Agent wallet login\n\n  Wallet: {walletaddress}\n  Nonce: {nonce}{extension_context}"

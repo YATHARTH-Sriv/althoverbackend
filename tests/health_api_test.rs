@@ -2,7 +2,9 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
-use myagentrust::{AppState, create_app, solanasetup::create_rpc_client};
+use std::sync::Arc;
+
+use myagentrust::{AppConfig, AppState, create_app, solanasetup::create_rpc_client};
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
@@ -14,6 +16,7 @@ fn test_app() -> axum::Router {
         db,
         rpc: create_rpc_client("http://127.0.0.1:8899"),
         http: reqwest::Client::new(),
+        config: Arc::new(AppConfig::for_tests()),
     })
 }
 
@@ -69,4 +72,32 @@ async fn health_rejects_unsupported_method() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn customer_routes_validate_required_inputs_before_database_access() {
+    let list_response = test_app()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/customers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), StatusCode::BAD_REQUEST);
+
+    let create_response = test_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/customers")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

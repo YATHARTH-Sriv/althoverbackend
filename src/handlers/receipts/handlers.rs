@@ -4,172 +4,22 @@ use axum::{
     Json,
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Response, header},
+    http::{HeaderMap, Response, header},
 };
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
-use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::{ApiError, AppState, bad_request, internal_error};
+use crate::{
+    ApiError, AppState,
+    access::{SettingsAccess, require_settings_access, require_settings_member_by_id},
+    bad_request, internal_error,
+    money::parse_decimal_units,
+};
 
-use super::{auth::normalize_wallet_address, extension_auth::extension_token_hash};
-
-const MAX_RECEIPT_BYTES: usize = 20 * 1024 * 1024;
-
-#[derive(Debug, FromRow)]
-struct SettingsAccess {
-    id: Uuid,
-    workspace_id: Uuid,
-}
-
-#[derive(Debug, FromRow)]
-struct ReceiptRow {
-    id: Uuid,
-    settings_account_id: Uuid,
-    smart_account_id: Option<Uuid>,
-    transaction_record_id: Option<Uuid>,
-    uploaded_by_wallet: String,
-    file_pathname: String,
-    file_name: Option<String>,
-    file_mime_type: Option<String>,
-    file_size_bytes: Option<i32>,
-    vendor: Option<String>,
-    amount: Option<String>,
-    currency: Option<String>,
-    due_date: Option<DateTime<Utc>>,
-    invoice_number: Option<String>,
-    category: Option<String>,
-    payment_recipient: Option<String>,
-    confidence: Option<f64>,
-    status: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    workspace_id: Uuid,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PublicReceipt {
-    id: Uuid,
-    settings_account_id: Uuid,
-    smart_account_id: Option<Uuid>,
-    transaction_record_id: Option<Uuid>,
-    uploaded_by_wallet: String,
-    file_url: String,
-    file_name: Option<String>,
-    file_mime_type: Option<String>,
-    file_size_bytes: Option<i32>,
-    vendor: Option<String>,
-    amount: Option<String>,
-    currency: Option<String>,
-    due_date: Option<DateTime<Utc>>,
-    invoice_number: Option<String>,
-    category: Option<String>,
-    payment_recipient: Option<String>,
-    confidence: Option<f64>,
-    status: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ReceiptResponse {
-    receipt: PublicReceipt,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScanReceiptQuery {
-    wallet_address: String,
-    settings_pda: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateReceiptRequest {
-    wallet_address: String,
-    smart_account_id: Option<Uuid>,
-    vendor: Option<String>,
-    amount: Option<serde_json::Value>,
-    currency: Option<String>,
-    due_date: Option<String>,
-    invoice_number: Option<String>,
-    category: Option<String>,
-    payment_recipient: Option<String>,
-    confidence: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteReceiptRequest {
-    wallet_address: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteReceiptResponse {
-    ok: bool,
-    receipt_id: Uuid,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReceiptFileQuery {
-    wallet_address: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReceiptPaymentRequest {
-    wallet_address: String,
-    transaction_record_id: Uuid,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NodeProcessedReceipt {
-    source_mime_type: String,
-    extraction_mime_type: String,
-    extraction: ExtractedReceipt,
-    file: NodeFile,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ExtractedReceipt {
-    vendor: Option<String>,
-    amount: Option<serde_json::Value>,
-    currency: Option<String>,
-    due_date: Option<String>,
-    invoice_number: Option<String>,
-    category: Option<String>,
-    payment_recipient: Option<String>,
-    confidence: Option<f64>,
-    raw_text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NodeFile {
-    url: String,
-    pathname: String,
-    name: String,
-    mime_type: String,
-    size_bytes: usize,
-}
-
-fn internal_url(path: &str) -> String {
-    let base =
-        std::env::var("NODE_INTERNAL_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_owned());
-    format!("{}{}", base.trim_end_matches('/'), path)
-}
-
-fn internal_token() -> Result<String, ApiError> {
-    std::env::var("INTERNAL_SERVICE_TOKEN")
-        .map_err(|_| internal_error("INTERNAL_SERVICE_TOKEN is required"))
-}
+use super::super::{auth::normalize_wallet_address, extension_auth::extension_token_hash};
+use super::models::*;
+use super::processor;
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
     let value = headers
@@ -182,33 +32,6 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
         .ok_or_else(|| bad_request("Extension session token is required"))
 }
 
-fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-fn validate_file(mime_type: &str, body: &Bytes) -> Result<(), ApiError> {
-    if !matches!(
-        mime_type,
-        "image/png" | "image/jpeg" | "image/webp" | "application/pdf" | "text/plain"
-    ) {
-        return Err(bad_request(
-            "Upload an image, PDF, or selected invoice text.",
-        ));
-    }
-    if body.is_empty() {
-        return Err(bad_request("Receipt file is empty."));
-    }
-    if body.len() > MAX_RECEIPT_BYTES {
-        return Err(bad_request("Receipt file must be 20MB or smaller."));
-    }
-    Ok(())
-}
-
 fn amount_string(value: Option<&serde_json::Value>) -> Result<Option<String>, ApiError> {
     let Some(value) = value else { return Ok(None) };
     let value = match value {
@@ -217,12 +40,7 @@ fn amount_string(value: Option<&serde_json::Value>) -> Result<Option<String>, Ap
         serde_json::Value::Null => return Ok(None),
         _ => return Err(bad_request("amount is invalid")),
     };
-    let parsed = value
-        .parse::<f64>()
-        .map_err(|_| bad_request("amount is invalid"))?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        return Err(bad_request("amount is invalid"));
-    }
+    parse_decimal_units(&value, 9, "amount")?;
     Ok(Some(value))
 }
 
@@ -321,6 +139,7 @@ pub(crate) async fn load_receipts_for_settings(
         JOIN settings_accounts AS settings ON settings.id = receipt.settings_account_id
         WHERE receipt.settings_account_id = $1
         ORDER BY receipt.created_at DESC
+        LIMIT 100
         "#,
     )
     .bind(settings_id)
@@ -386,20 +205,7 @@ async fn settings_access(
     settings_pda: &str,
     wallet: &str,
 ) -> Result<SettingsAccess, ApiError> {
-    sqlx::query_as::<_, SettingsAccess>(
-        r#"
-        SELECT settings.id, settings.workspace_id
-        FROM settings_accounts AS settings
-        JOIN settings_signers AS signer ON signer.settings_account_id = settings.id
-        WHERE settings.pda = $1 AND signer.wallet_address = $2
-        "#,
-    )
-    .bind(settings_pda)
-    .bind(wallet)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| bad_request("Wallet is not a signer for this settings account"))
+    require_settings_access(state, settings_pda, wallet, None, false).await
 }
 
 async fn ensure_receipt_access(
@@ -407,75 +213,7 @@ async fn ensure_receipt_access(
     receipt: &ReceiptRow,
     wallet: &str,
 ) -> Result<(), ApiError> {
-    let allowed = sqlx::query_scalar::<_, bool>(
-        r#"
-        SELECT EXISTS(
-            SELECT 1 FROM settings_signers
-            WHERE settings_account_id = $1 AND wallet_address = $2
-        )
-        "#,
-    )
-    .bind(receipt.settings_account_id)
-    .bind(wallet)
-    .fetch_one(&state.db)
-    .await
-    .map_err(internal_error)?;
-    if !allowed {
-        return Err(bad_request(
-            "Wallet is not a signer for this settings account",
-        ));
-    }
-    Ok(())
-}
-
-async fn process_file(
-    state: &AppState,
-    settings_id: Uuid,
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> Result<NodeProcessedReceipt, ApiError> {
-    let mime_type = header_string(headers, "content-type")
-        .unwrap_or_else(|| "application/octet-stream".to_owned());
-    let mime_type = mime_type.split(';').next().unwrap_or("").trim();
-    validate_file(mime_type, body)?;
-    let file_name = header_string(headers, "x-file-name").unwrap_or_else(|| "receipt".to_owned());
-    let response = state
-        .http
-        .post(internal_url("/internal/receipts/process"))
-        .bearer_auth(internal_token()?)
-        .header("content-type", mime_type)
-        .header("x-file-name", file_name)
-        .header("x-hover-settings-account-id", settings_id.to_string())
-        .body(body.clone())
-        .send()
-        .await
-        .map_err(internal_error)?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let message = response.text().await.unwrap_or_default();
-        return Err(internal_error(format!(
-            "Receipt processor failed with {status}: {message}"
-        )));
-    }
-    response.json().await.map_err(internal_error)
-}
-
-async fn delete_internal_file(state: &AppState, pathname: &str) -> Result<(), ApiError> {
-    let response = state
-        .http
-        .post(internal_url("/internal/receipts/file/delete"))
-        .bearer_auth(internal_token()?)
-        .json(&serde_json::json!({ "pathname": pathname }))
-        .send()
-        .await
-        .map_err(internal_error)?;
-    if !response.status().is_success() {
-        return Err(internal_error(format!(
-            "Receipt file deletion failed with {}",
-            response.status()
-        )));
-    }
-    Ok(())
+    require_settings_member_by_id(state, receipt.settings_account_id, wallet).await
 }
 
 async fn insert_processed_receipt(
@@ -492,12 +230,12 @@ async fn insert_processed_receipt(
             "SELECT EXISTS(SELECT 1 FROM smart_accounts WHERE id = $1 AND settings_account_id = $2)",
         )
         .bind(smart_account_id)
-        .bind(settings.id)
+        .bind(settings.settings_account_id)
         .fetch_one(&state.db)
         .await
         .map_err(internal_error)?;
         if !valid {
-            let _ = delete_internal_file(state, &processed.file.pathname).await;
+            let _ = processor::delete_file(state, &processed.file.pathname).await;
             return Err(bad_request(
                 "Smart account does not belong to this settings account",
             ));
@@ -543,7 +281,7 @@ async fn insert_processed_receipt(
                   confidence, status, created_at, updated_at, $20 AS workspace_id
         "#,
     )
-    .bind(settings.id)
+    .bind(settings.settings_account_id)
     .bind(smart_account_id)
     .bind(wallet)
     .bind(&processed.file.url)
@@ -573,7 +311,7 @@ async fn insert_processed_receipt(
                    VALUES ($1,$2,$3,'RECEIPT_SCANNED','Receipt uploaded',$4)"#,
             )
             .bind(settings.workspace_id)
-            .bind(settings.id)
+            .bind(settings.settings_account_id)
             .bind(smart_account_id)
             .bind(serde_json::json!({ "receiptId": receipt.id, "fileName": receipt.file_name }))
             .execute(&state.db)
@@ -582,7 +320,7 @@ async fn insert_processed_receipt(
             Ok(receipt)
         }
         Err(error) => {
-            let _ = delete_internal_file(state, &processed.file.pathname).await;
+            let _ = processor::delete_file(state, &processed.file.pathname).await;
             Err(internal_error(error))
         }
     }
@@ -599,7 +337,8 @@ pub async fn scan_receipt(
         .map_err(|_| bad_request("settingsPda is invalid"))?
         .to_string();
     let settings = settings_access(&state, &settings_pda, &wallet).await?;
-    let processed = process_file(&state, settings.id, &headers, &body).await?;
+    let processed =
+        processor::process_file(&state, settings.settings_account_id, &headers, &body).await?;
     let receipt =
         insert_processed_receipt(&state, &settings, &wallet, None, None, None, processed).await?;
     Ok(Json(ReceiptResponse {
@@ -612,11 +351,16 @@ pub async fn extension_scan_receipt(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ReceiptResponse>, ApiError> {
-    let token_hash = extension_token_hash(bearer_token(&headers)?)?;
+    let token_hash = extension_token_hash(&state, bearer_token(&headers)?)?;
     let session = sqlx::query_as::<_, SettingsAccess>(
-        r#"SELECT settings.id, settings.workspace_id
+        r#"SELECT settings.id AS settings_account_id, settings.workspace_id,
+                  settings.settings_authority,
+                  COALESCE(signer.permissions_mask, 0) AS permissions_mask
            FROM extension_sessions AS session
            JOIN settings_accounts AS settings ON settings.id = session.settings_account_id
+           LEFT JOIN settings_signers AS signer
+             ON signer.settings_account_id = settings.id
+            AND signer.wallet_address = session.wallet_address
            WHERE session.token_hash = $1 AND session.revoked_at IS NULL
              AND session.expires_at > NOW()"#,
     )
@@ -632,12 +376,13 @@ pub async fn extension_scan_receipt(
     .fetch_one(&state.db)
     .await
     .map_err(internal_error)?;
-    let smart_account_id = header_string(&headers, "x-hover-smart-account-id")
+    let smart_account_id = processor::header_string(&headers, "x-hover-smart-account-id")
         .map(|value| Uuid::parse_str(&value).map_err(|_| bad_request("smartAccountId is invalid")))
         .transpose()?;
-    let source_url = header_string(&headers, "x-hover-source-url");
-    let source_title = header_string(&headers, "x-hover-source-title");
-    let processed = process_file(&state, session.id, &headers, &body).await?;
+    let source_url = processor::header_string(&headers, "x-hover-source-url");
+    let source_title = processor::header_string(&headers, "x-hover-source-title");
+    let processed =
+        processor::process_file(&state, session.settings_account_id, &headers, &body).await?;
     let receipt = insert_processed_receipt(
         &state,
         &session,
@@ -739,7 +484,7 @@ pub async fn delete_receipt(
             "Receipts with prepared or completed payments cannot be deleted.",
         ));
     }
-    delete_internal_file(&state, &receipt.file_pathname).await?;
+    processor::delete_file(&state, &receipt.file_pathname).await?;
     sqlx::query("DELETE FROM receipts WHERE id=$1")
         .bind(id)
         .execute(&state.db)
@@ -764,23 +509,7 @@ pub async fn receipt_file(
     let wallet = normalize_wallet_address(&query.wallet_address)?;
     let receipt = load_receipt(&state, id).await?;
     ensure_receipt_access(&state, &receipt, &wallet).await?;
-    let response = state
-        .http
-        .get(internal_url("/internal/receipts/file"))
-        .bearer_auth(internal_token()?)
-        .query(&[("pathname", &receipt.file_pathname)])
-        .send()
-        .await
-        .map_err(internal_error)?;
-    if !response.status().is_success() {
-        return Err(bad_request("Receipt file is not available"));
-    }
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .cloned()
-        .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
-    let bytes = response.bytes().await.map_err(internal_error)?;
+    let (content_type, bytes) = processor::fetch_file(&state, &receipt.file_pathname).await?;
     let filename = receipt
         .file_name
         .unwrap_or_else(|| "receipt".to_owned())

@@ -1,4 +1,3 @@
--- Add migration script here
 CREATE TABLE workspaces (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,

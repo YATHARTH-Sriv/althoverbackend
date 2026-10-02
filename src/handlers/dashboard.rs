@@ -230,9 +230,22 @@ pub async fn dashboard(
     let mut settings = Vec::with_capacity(settings_rows.len());
 
     for row in settings_rows {
-        let signers = load_signers(&state, row.id).await?;
-        let activities = load_activities(&state, row.id).await?;
-        let mut smart_account_rows = load_smart_accounts(&state, row.id).await?;
+        let stale_index = row
+            .stale_transaction_index
+            .parse::<u64>()
+            .map_err(internal_error)?;
+        let (signers, activities, mut smart_account_rows, transactions, receipts) = tokio::try_join!(
+            load_signers(&state, row.id),
+            load_activities(&state, row.id),
+            load_smart_accounts(&state, row.id),
+            load_transactions_for_dashboard(
+                &state,
+                row.id,
+                stale_index,
+                query.refresh.unwrap_or(false),
+            ),
+            load_receipts_for_settings(&state, row.id),
+        )?;
 
         if query.refresh.unwrap_or(false) {
             let mut refreshed_rows = Vec::with_capacity(smart_account_rows.len());
@@ -246,19 +259,6 @@ pub async fn dashboard(
             .into_iter()
             .map(SmartAccountResponse::from)
             .collect();
-        let stale_index = row
-            .stale_transaction_index
-            .parse::<u64>()
-            .map_err(internal_error)?;
-        let transactions = load_transactions_for_dashboard(
-            &state,
-            row.id,
-            stale_index,
-            query.refresh.unwrap_or(false),
-        )
-        .await?;
-        let receipts = load_receipts_for_settings(&state, row.id).await?;
-
         settings.push(DashboardSettingsResponse {
             id: row.id,
             name: row.name,

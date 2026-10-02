@@ -21,22 +21,16 @@ pub struct ProgramConfigResponse {
     treasury: String,
 }
 
-fn internal_agent_url() -> String {
-    let base =
-        std::env::var("NODE_INTERNAL_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_owned());
-    format!(
-        "{}/internal/agent/settings/chat",
-        base.trim_end_matches('/')
-    )
+fn internal_token(state: &AppState) -> Result<&str, ApiError> {
+    state
+        .config
+        .internal_service_token
+        .as_deref()
+        .ok_or_else(|| internal_error("INTERNAL_SERVICE_TOKEN is required"))
 }
 
-fn internal_token() -> Result<String, ApiError> {
-    std::env::var("INTERNAL_SERVICE_TOKEN")
-        .map_err(|_| internal_error("INTERNAL_SERVICE_TOKEN is required"))
-}
-
-fn require_internal_token(headers: &HeaderMap) -> Result<(), ApiError> {
-    let expected = internal_token()?;
+fn require_internal_token(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let expected = internal_token(state)?;
     let provided = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -61,7 +55,7 @@ pub async fn agent_program_config(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<ProgramConfigResponse>, ApiError> {
-    require_internal_token(&headers)?;
+    require_internal_token(&state, &headers)?;
     let (program_config_pda, config) = fetch_program_config(state.rpc.as_ref())
         .await
         .map_err(internal_error)?;
@@ -80,8 +74,8 @@ pub async fn settings_agent_chat(
 ) -> Result<Response<Body>, ApiError> {
     let response = state
         .http
-        .post(internal_agent_url())
-        .bearer_auth(internal_token()?)
+        .post(state.config.node_url("/internal/agent/settings/chat"))
+        .bearer_auth(internal_token(&state)?)
         .json(&payload)
         .send()
         .await

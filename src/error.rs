@@ -1,38 +1,61 @@
-use axum::{Json, http::StatusCode};
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::Serialize;
 
-#[derive(Serialize)]
-pub struct ErrorBody {
-    error: String,
+#[derive(Debug)]
+pub enum ApiError {
+    BadRequest(String),
+    Unauthorized(String),
+    NotFound(String),
+    Internal,
 }
 
-pub type ApiError = (StatusCode, Json<ErrorBody>);
+#[derive(Debug, Serialize)]
+pub struct ErrorBody {
+    error: String,
+    code: &'static str,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match self {
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
+            Self::Unauthorized(message) => (StatusCode::UNAUTHORIZED, "unauthorized", message),
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, "not_found", message),
+            Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error".to_owned(),
+            ),
+        };
+
+        (
+            status,
+            Json(ErrorBody {
+                error: message,
+                code,
+            }),
+        )
+            .into_response()
+    }
+}
 
 pub fn bad_request(message: impl Into<String>) -> ApiError {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorBody {
-            error: message.into(),
-        }),
-    )
+    ApiError::BadRequest(message.into())
 }
 
 pub fn unauthorized(message: impl Into<String>) -> ApiError {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(ErrorBody {
-            error: message.into(),
-        }),
-    )
+    ApiError::Unauthorized(message.into())
+}
+
+pub fn not_found(message: impl Into<String>) -> ApiError {
+    ApiError::NotFound(message.into())
 }
 
 pub fn internal_error(error: impl std::fmt::Display) -> ApiError {
-    eprintln!("internal server error: {error}");
-
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorBody {
-            error: "Internal server error".to_owned(),
-        }),
-    )
+    tracing::error!(error = %error, "request failed");
+    ApiError::Internal
 }
