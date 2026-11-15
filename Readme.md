@@ -1,5 +1,11 @@
 # Project Hover Built on Squads Smart Account Program v0.1 
 
+## Tweet Links For Understanding Each Feature Built
+1. [Full altitude Type style app](https://x.com/Yathart79744150/status/2106751982266724844)
+2. [Payouts :manage context based payments like superteam Grants](https://x.com/Yathart79744150/status/2106754390103306518)
+3. [Invoices:Charge and Also Track Your Payments from customers](https://x.com/Yathart79744150/status/2106757618492645425)
+4. [Extensions To Make Sure You Never Miss a bill to track ](https://x.com/Yathart79744150/status/2106761875887464861)
+
 ## This Project Contains Four Components/Respositoires 
 
 1. Backend : https://github.com/YATHARTH-Sriv/althoverbackend
